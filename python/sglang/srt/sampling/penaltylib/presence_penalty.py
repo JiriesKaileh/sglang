@@ -1,6 +1,10 @@
+import dataclasses
+
 import torch
 
+from sglang.kernels.ops.sampling.penalties import TokenPenalty, cumulate_padded_tokens
 from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
+from sglang.srt.sampling.penaltylib.speculative import SpeculativePenalties
 from sglang.srt.utils.device import is_pin_memory_available
 
 
@@ -41,6 +45,28 @@ class BatchedPresencePenalizer(_BatchedPenalizer):
             dim=1,
             index=output_ids.unsqueeze(1),
             src=self.presence_penalties,
+        )
+
+    def _cumulate_padded_output_tokens(
+        self, output_ids: torch.Tensor, output_lens: torch.Tensor
+    ):
+        cumulate_padded_tokens(
+            self.cumulated_presence_penalties,
+            self.presence_penalties,
+            output_ids,
+            output_lens,
+            accumulate=False,
+        )
+
+    def _add_speculative_state(
+        self, penalties: SpeculativePenalties
+    ) -> SpeculativePenalties:
+        return dataclasses.replace(
+            penalties,
+            presence=TokenPenalty(
+                coefficients=self.presence_penalties,
+                table=self.cumulated_presence_penalties,
+            ),
         )
 
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:

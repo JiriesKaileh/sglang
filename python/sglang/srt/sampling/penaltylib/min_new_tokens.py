@@ -1,6 +1,10 @@
+import dataclasses
+
 import torch
 
+from sglang.kernels.ops.sampling.penalties import MinNewTokensState
 from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
+from sglang.srt.sampling.penaltylib.speculative import SpeculativePenalties
 from sglang.srt.utils.device import is_pin_memory_available
 
 
@@ -75,6 +79,10 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
                 device=self.orchestrator.device,
             ),
         )[:, : self.orchestrator.vocab_size]
+        # The stop ids padded with -1, for per-row speculative penalties.
+        self.stop_token_ids = torch.where(
+            padded_stop_token_ids < vocab_size, padded_stop_token_ids, -1
+        )
 
         self.len_output_tokens = torch.zeros(
             size=(len(self.orchestrator.reqs()), 1),
@@ -84,6 +92,28 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
 
     def _cumulate_output_tokens(self, output_ids: torch.Tensor):
         self.len_output_tokens += 1
+
+    def _cumulate_padded_output_tokens(
+        self, output_ids: torch.Tensor, output_lens: torch.Tensor
+    ):
+        # Clamped as the other penalizers' count kernel clamps them.
+        counted = output_lens.clamp(0, output_ids.shape[1])
+        self.len_output_tokens.add_(
+            counted.reshape(-1, 1).to(self.len_output_tokens.dtype)
+        )
+
+    def _add_speculative_state(
+        self, penalties: SpeculativePenalties
+    ) -> SpeculativePenalties:
+        return dataclasses.replace(
+            penalties,
+            min_new_tokens=MinNewTokensState(
+                min_new_tokens=self.min_new_tokens,
+                output_lengths=self.len_output_tokens,
+                stop_penalties=self.stop_token_penalties,
+                stop_token_ids=self.stop_token_ids,
+            ),
+        )
 
     def _apply(self, logits: torch.Tensor):
         # Boolean-mask indexing (logits[mask]) is data-dependent and forces a
@@ -95,6 +125,7 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
     def _filter(self, keep_indices: torch.Tensor):
         self.min_new_tokens = self.min_new_tokens[keep_indices]
         self.stop_token_penalties = self.stop_token_penalties[keep_indices]
+        self.stop_token_ids = self.stop_token_ids[keep_indices]
         self.len_output_tokens = self.len_output_tokens[keep_indices]
 
     def _merge(self, their: "BatchedMinNewTokensPenalizer"):
@@ -104,12 +135,25 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
         self.stop_token_penalties = torch.cat(
             [self.stop_token_penalties, their.stop_token_penalties], dim=0
         )
+        width = max(self.stop_token_ids.shape[1], their.stop_token_ids.shape[1])
+        self.stop_token_ids = torch.cat(
+            [
+                torch.nn.functional.pad(ids, (0, width - ids.shape[1]), value=-1)
+                for ids in (self.stop_token_ids, their.stop_token_ids)
+            ],
+            dim=0,
+        )
         self.len_output_tokens = torch.cat(
             [self.len_output_tokens, their.len_output_tokens], dim=0
         )
 
     # Explicit resource cleanup to aid GC and free CUDA memory promptly
     def _teardown(self) -> None:
-        for name in ("min_new_tokens", "stop_token_penalties", "len_output_tokens"):
+        for name in (
+            "min_new_tokens",
+            "stop_token_penalties",
+            "stop_token_ids",
+            "len_output_tokens",
+        ):
             if hasattr(self, name):
                 delattr(self, name)

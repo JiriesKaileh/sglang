@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Optional, Set, Type
 
 import torch
 
+from sglang.srt.sampling.penaltylib.speculative import SpeculativePenalties
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
 
@@ -27,6 +29,8 @@ class BatchedPenalizerOrchestrator:
             pen_is_required = penalizer.prepare_if_required()
             is_required |= pen_is_required
         self.is_required = is_required
+        # The end of the tables' writes on another stream (see record_commits).
+        self._commits_done: Optional[torch.Event] = None
 
     @property
     def batch(self) -> ScheduleBatch | None:
@@ -42,15 +46,52 @@ class BatchedPenalizerOrchestrator:
     def reqs(self):
         return self.batch.reqs
 
-    def cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def cumulate_output_tokens(
+        self, output_ids: torch.Tensor, output_lens: Optional[torch.Tensor] = None
+    ):
         """
         Feed the output tokens to the penalizers.
 
         Args:
-            output_ids (torch.Tensor): The output tokens.
+            output_ids: One token per request, or with ``output_lens`` a padded
+                ``[bs, width]`` block of tokens per request.
+            output_lens: ``[bs]``; each request counts the first
+                ``output_lens[b]`` tokens of its row, in order, with the
+                length clamped to ``[0, width]``.
         """
         for penalizer in self.penalizers.values():
-            penalizer.cumulate_output_tokens(output_ids=output_ids)
+            if output_lens is None:
+                penalizer.cumulate_output_tokens(output_ids=output_ids)
+            else:
+                penalizer.cumulate_padded_output_tokens(output_ids, output_lens)
+
+    def record_commits(self) -> None:
+        """Mark the end of the tables' writes on the current stream.
+
+        Speculative decoding counts tokens on the forward stream; ``filter``,
+        ``merge`` and ``release`` wait for those writes on their own stream
+        before they copy or free the tables.
+        """
+        event = torch.get_device_module(self.device).Event()
+        event.record()
+        self._commits_done = event
+
+    def _wait_for_commits(self) -> None:
+        if self._commits_done is not None:
+            torch.get_device_module(self.device).current_stream().wait_event(
+                self._commits_done
+            )
+            self._commits_done = None
+
+    def speculative_penalties(
+        self, additive: torch.Tensor, scaling: Optional[torch.Tensor]
+    ) -> SpeculativePenalties:
+        """A view of the penalty state for per-row penalties of verify blocks;
+        ``additive`` and ``scaling`` are this step's block-start tables."""
+        penalties = SpeculativePenalties(additive=additive, scaling=scaling)
+        for penalizer in self.penalizers.values():
+            penalties = penalizer.add_speculative_state(penalties)
+        return penalties
 
     def apply(self, logits: torch.Tensor, repeat: Optional[int] = None):
         """
@@ -113,6 +154,7 @@ class BatchedPenalizerOrchestrator:
         if not self.is_required:
             return
 
+        self._wait_for_commits()
         if len(keep_indices) == 0:
             # No requests left in the batch, fully release orchestrator resources
             self.release()
@@ -131,6 +173,7 @@ class BatchedPenalizerOrchestrator:
     # Resource management helpers
     def release(self) -> None:
         """Release all penalizers and break references so GC can reclaim promptly."""
+        self._wait_for_commits()
         for penalizer in self.penalizers.values():
             penalizer.teardown()
         self.penalizers.clear()
@@ -159,6 +202,8 @@ class BatchedPenalizerOrchestrator:
         if not self.is_required and not their.is_required:
             return
 
+        self._wait_for_commits()
+        their._wait_for_commits()
         self.is_required = True
         for penalizer, their_penalizer in their.penalizers.items():
             self.penalizers[penalizer].merge(their_penalizer)
@@ -215,6 +260,22 @@ class _BatchedPenalizer(abc.ABC):
 
         self._cumulate_output_tokens(output_ids=output_ids)
 
+    def cumulate_padded_output_tokens(
+        self, output_ids: torch.Tensor, output_lens: torch.Tensor
+    ):
+        if not self._is_prepared:
+            return
+
+        self._cumulate_padded_output_tokens(output_ids, output_lens)
+
+    def add_speculative_state(
+        self, penalties: SpeculativePenalties
+    ) -> SpeculativePenalties:
+        if not self._is_prepared:
+            return penalties
+
+        return self._add_speculative_state(penalties)
+
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if not self._is_prepared:
             return
@@ -255,6 +316,27 @@ class _BatchedPenalizer(abc.ABC):
         """
         Cumulate the output tokens.
         Orchestrator will call this function to feed the output tokens to the penalizer.
+        """
+        pass
+
+    @abc.abstractmethod
+    def _cumulate_padded_output_tokens(
+        self, output_ids: torch.Tensor, output_lens: torch.Tensor
+    ):
+        """
+        Cumulate the first ``output_lens[b]`` tokens of each row of the padded
+        ``[bs, width]`` ``output_ids``, as ``_cumulate_output_tokens`` would one
+        column at a time; lengths outside ``[0, width]`` are clamped.
+        """
+        pass
+
+    @abc.abstractmethod
+    def _add_speculative_state(
+        self, penalties: SpeculativePenalties
+    ) -> SpeculativePenalties:
+        """
+        ``penalties`` with this penalizer's state, which the per-row penalties of
+        chain speculative verify blocks read.
         """
         pass
 

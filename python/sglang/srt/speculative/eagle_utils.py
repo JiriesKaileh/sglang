@@ -1295,8 +1295,14 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
 
     # Accumulate penalty
-    # This is a relaxed version of penalties for speculative decoding.
-    if batch.sampling_info.penalizer_orchestrator.is_required:
+    # This is a relaxed version of penalties for speculative decoding. The
+    # scheduler counts the committed tokens of algorithms that track the
+    # speculative penalty history; of those, plugin algorithms (CustomSpecAlgo
+    # subclasses) prepare decode here, while the DFlash family has its own.
+    if (
+        batch.sampling_info.penalizer_orchestrator.is_required
+        and not batch.spec_algorithm.tracks_speculative_penalty_history()
+    ):
         batch.cumulate_penalty_output_tokens()
 
     page_size = batch.token_to_kv_pool_allocator.page_size
